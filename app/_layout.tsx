@@ -1,30 +1,37 @@
 import { Slot, useRouter, useSegments, useRootNavigationState } from 'expo-router';
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { SessionProvider, useSession } from '../context/AuthContext';
+import { NotificationProvider } from '../context/NotificationContext';
 import { View, ActivityIndicator } from 'react-native';
 
-function InitialLayout() {
+function RootLayoutNav() {
   const { user, isLoading } = useSession();
   const segments = useSegments();
   const router = useRouter();
   const navigationState = useRootNavigationState();
+  const [isMounted, setIsMounted] = useState(false);
 
   useEffect(() => {
-    if (isLoading) return;
-    if (!navigationState?.key) return;
+    // wait for layout to mount
+    const t = setTimeout(() => setIsMounted(true), 500);
+    return () => clearTimeout(t);
+  }, []);
 
-    const inAuthGroup = segments[0] === '(auth)';
+  useEffect(() => {
+    if (!isMounted || isLoading) return;
 
+    const segmentsList = segments as string[];
+    const inAuthGroup = segmentsList.includes('(auth)');
+    const inAppGroup = segmentsList.includes('(app)');
+    
     if (!user && !inAuthGroup) {
-      // Redirect to the sign-in page.
-      setTimeout(() => router.replace('/login'), 0);
-    } else if (user && inAuthGroup) {
-      // Redirect away from the sign-in page.
-      setTimeout(() => router.replace('/dashboard'), 0);
+      router.replace('/login');
+    } else if (user && !inAppGroup) {
+      router.replace('/dashboard');
     }
-  }, [user, segments, isLoading, navigationState?.key]);
+  }, [user, segments, isLoading, isMounted]);
 
-  if (isLoading) {
+  if (!isMounted || isLoading) {
     return (
       <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
         <ActivityIndicator size="large" />
@@ -38,7 +45,9 @@ function InitialLayout() {
 export default function RootLayout() {
   return (
     <SessionProvider>
-      <InitialLayout />
+      <NotificationProvider>
+        <RootLayoutNav />
+      </NotificationProvider>
     </SessionProvider>
   );
 }

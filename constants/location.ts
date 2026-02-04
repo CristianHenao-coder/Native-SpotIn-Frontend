@@ -1,8 +1,8 @@
 export const TARGET_LOCATION = {
-    // Example coordinates (Change these to your Institution's location)
-    latitude: 6.2442,   // Example: Medelling, Colombia
-    longitude: -75.5812,
-    radiusMeters: 100, // Allowed radius in meters
+    // Riwi - Centros Comerciales de Moda, Medellín
+    latitude: 6.1759,
+    longitude: -75.5906,
+    radiusMeters: 100, // Strict radius for attendance
 };
 
 // Haversine formula to calculate distance in meters

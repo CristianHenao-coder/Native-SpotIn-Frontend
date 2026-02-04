@@ -1,4 +1,4 @@
-import { View, Text, TextInput, TouchableOpacity, Alert } from "react-native";
+import { View, Text, TextInput, TouchableOpacity, Alert, ActivityIndicator } from "react-native";
 import { Image } from "expo-image";
 import { useRouter, Link } from "expo-router";
 import { useSession } from "../../context/AuthContext";
@@ -8,8 +8,10 @@ import { useEffect, useState } from "react";
 
 export default function Login() {
   const router = useRouter();
-  const { signIn } = useSession();
+  const { signIn, isLoading } = useSession();
   const [isBiometricSupported, setIsBiometricSupported] = useState(false);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
 
   useEffect(() => {
     (async () => {
@@ -30,15 +32,23 @@ export default function Login() {
       promptMessage: "Welcome back! Login with Biometrics",
     });
     if (result.success) {
-      // In a real app, you might validate the stored token here
-      signIn();
+      // User is already logged in via stored session
       router.replace("/dashboard");
     }
   };
 
-  const handleLogin = () => {
-    signIn(); // This now stores the session in SecureStore
-    router.replace("/dashboard");
+  const handleLogin = async () => {
+    if (!email || !password) {
+      Alert.alert("Error", "Please enter email and password");
+      return;
+    }
+
+    try {
+      await signIn(email, password);
+      router.replace("/dashboard");
+    } catch (error: any) {
+      Alert.alert("Login Failed", error.message || "Invalid credentials");
+    }
   };
 
   const handleBiometricLogin = async () => await promptBiometrics();
@@ -87,6 +97,8 @@ export default function Login() {
           </Text>
           <TextInput
             placeholder="email@example.com"
+            value={email}
+            onChangeText={setEmail}
             style={{
               width: "100%",
               backgroundColor: "white",
@@ -97,6 +109,9 @@ export default function Login() {
             }}
             keyboardType="email-address"
             autoCapitalize="none"
+            autoCorrect={false}
+            autoComplete="email"
+            editable={!isLoading}
           />
         </View>
 
@@ -113,6 +128,8 @@ export default function Login() {
           </Text>
           <TextInput
             placeholder="********"
+            value={password}
+            onChangeText={setPassword}
             secureTextEntry
             style={{
               width: "100%",
@@ -122,13 +139,17 @@ export default function Login() {
               borderWidth: 1,
               borderColor: "#e5e7eb",
             }}
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable={!isLoading}
           />
         </View>
 
         <TouchableOpacity
           onPress={handleLogin}
+          disabled={isLoading}
           style={{
-            backgroundColor: "#4f46e5",
+            backgroundColor: isLoading ? "#9ca3af" : "#4f46e5",
             padding: 16,
             borderRadius: 12,
             alignItems: "center",
@@ -140,12 +161,16 @@ export default function Login() {
             elevation: 4,
           }}
         >
-          <Text style={{ color: "white", fontWeight: "bold", fontSize: 16 }}>
-            Sign In
-          </Text>
+          {isLoading ? (
+            <ActivityIndicator color="white" />
+          ) : (
+            <Text style={{ color: "white", fontWeight: "bold", fontSize: 16 }}>
+              Sign In
+            </Text>
+          )}
         </TouchableOpacity>
 
-        {isBiometricSupported && (
+        {isBiometricSupported && !isLoading && (
           <TouchableOpacity
             onPress={handleBiometricLogin}
             style={{
@@ -165,18 +190,6 @@ export default function Login() {
             </Text>
           </TouchableOpacity>
         )}
-
-        {/* Register Link */}
-        <View style={{ flexDirection: "row", justifyContent: "center" }}>
-          <Text style={{ color: "#6b7280" }}>Don't have an account? </Text>
-          <Link href="/(auth)/register" asChild>
-            <TouchableOpacity>
-              <Text style={{ color: "#4f46e5", fontWeight: "bold" }}>
-                Sign Up
-              </Text>
-            </TouchableOpacity>
-          </Link>
-        </View>
       </View>
     </View>
   );

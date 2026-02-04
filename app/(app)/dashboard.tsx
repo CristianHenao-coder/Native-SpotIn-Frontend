@@ -4,53 +4,105 @@ import {
   TouchableOpacity,
   ScrollView,
   Alert,
-  Modal,
   StyleSheet,
-  Button,
+  ActivityIndicator,
+  RefreshControl,
 } from "react-native";
 import { useSession } from "../../context/AuthContext";
 import { useRouter } from "expo-router";
 import * as Location from "expo-location";
-import * as LocalAuthentication from "expo-local-authentication";
-import { CameraView, useCameraPermissions } from "expo-camera";
-import { useState } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   getDistanceFromLatLonInM,
   TARGET_LOCATION,
 } from "../../constants/location";
 import { Image } from "expo-image";
+import { attendanceService } from "../../services/attendance";
+import type { Attendance } from "../../types/api";
+import AttendanceHistoryItem from "../../components/ui/AttendanceHistoryItem";
+import QRButton from "../../components/ui/QRButton";
+import { formatAttendanceDate, formatAttendanceTime } from "../../utils/attendance";
+import { Ionicons } from "@expo/vector-icons";
+import { useNotifications } from "../../context/NotificationContext";
 
 export default function Dashboard() {
-  const { signOut, user } = useSession();
+  const { user, signOut } = useSession();
+  const { unreadCount } = useNotifications();
   const router = useRouter();
 
-  // State for Attendance Logic
-  const [isValidLocation, setIsValidLocation] = useState(false);
-  const [isQrScanned, setIsQrScanned] = useState(false);
-  const [scannedData, setScannedData] = useState("");
-  const [currentDistance, setCurrentDistance] = useState<number | null>(null);
+  // State
+  const [history, setHistory] = useState<Attendance[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [hasMarkedToday, setHasMarkedToday] = useState(false);
+  const [locationName, setLocationName] = useState("Verificando ubicación...");
+  const [isLocationVerified, setIsLocationVerified] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Camera State
-  const [permission, requestPermission] = useCameraPermissions();
-  const [isScannerOpen, setIsScannerOpen] = useState(false);
-
-  const handleLogout = () => {
-    signOut();
-    setTimeout(() => router.replace("/(auth)/login"), 0);
-  };
-
-  const handleCheckLocation = async () => {
+  const fetchDashboardData = useCallback(async () => {
+    setErrorMsg(null);
     try {
-      let { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== "granted") {
-        Alert.alert(
-          "Permission denied",
-          "Allow location access to mark attendance.",
-        );
+      const { items } = await attendanceService.getMyAttendance();
+      setHistory(items);
+      
+      // Check if marked today
+      const today = new Date().toISOString().split('T')[0];
+      const markedToday = items.some(item => item.dateKey === today);
+      setHasMarkedToday(markedToday);
+    } catch (error: any) {
+      if (error.response?.status === 403) {
+        setErrorMsg("Acceso restringido a historial");
+      } else if (error.response?.status !== 401) {
+        console.error("Error fetching attendance history:", error);
+      }
+    } finally {
+      setIsLoading(false);
+      setIsRefreshing(false);
+    }
+  }, []);
+
+  const checkLocation = async () => {
+    try {
+      const enabled = await Location.hasServicesEnabledAsync();
+      if (!enabled) {
+        setLocationName("GPS desactivado");
+        setIsLocationVerified(false);
         return;
       }
 
-      let location = await Location.getCurrentPositionAsync({});
+      let { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== "granted") {
+        setLocationName("Sin permiso GPS");
+        setIsLocationVerified(false);
+        return;
+      }
+
+      // Try last known first as it's instant
+      const lastLocation = await Location.getLastKnownPositionAsync();
+      if (lastLocation) {
+        const distance = getDistanceFromLatLonInM(
+          lastLocation.coords.latitude,
+          lastLocation.coords.longitude,
+          TARGET_LOCATION.latitude,
+          TARGET_LOCATION.longitude,
+        );
+        if (distance <= TARGET_LOCATION.radiusMeters) {
+          setIsLocationVerified(true);
+          setLocationName("Campus Central - Edificio A");
+          return; // Done if last known is good
+        }
+      }
+
+      // Try current position with a timeout
+      let location = await Promise.race([
+        Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+        }),
+        new Promise<null>((_, reject) => setTimeout(() => reject(new Error("Timeout")), 5000))
+      ]) as Location.LocationObject | null;
+
+      if (!location) throw new Error("Could not get location");
+
       const distance = getDistanceFromLatLonInM(
         location.coords.latitude,
         location.coords.longitude,
@@ -58,211 +110,351 @@ export default function Dashboard() {
         TARGET_LOCATION.longitude,
       );
 
-      setCurrentDistance(Math.round(distance));
-
       if (distance <= TARGET_LOCATION.radiusMeters) {
-        setIsValidLocation(true);
-        Alert.alert(
-          "Success",
-          `You are at the institution (${Math.round(distance)}m).`,
-        );
+        setIsLocationVerified(true);
+        setLocationName("Campus Central - Edificio A");
       } else {
-        setIsValidLocation(false);
-        Alert.alert(
-          "Too Far",
-          `You are ${Math.round(distance)}m away. Move closer!`,
-        );
+        setIsLocationVerified(false);
+        setLocationName(`A ${Math.round(distance)}m del campus`);
       }
     } catch (error) {
-      Alert.alert("Error", "Could not fetch location");
+      // Silently handle location errors as we show a UI status
+      setLocationName("Ubicación no disponible");
+      setIsLocationVerified(false);
     }
   };
 
-  const handleBarCodeScanned = ({
-    type,
-    data,
-  }: {
-    type: string;
-    data: string;
-  }) => {
-    setIsScannerOpen(false);
-    setScannedData(data);
-    setIsQrScanned(true);
-    Alert.alert("QR Scanned", `Code: ${data}`);
+  useEffect(() => {
+    if (user) {
+        fetchDashboardData();
+        checkLocation();
+    }
+  }, [user]);
+
+  const onRefresh = () => {
+    setIsRefreshing(true);
+    fetchDashboardData();
+    checkLocation();
   };
 
-  const handleMarkAttendance = async () => {
-    // Final security check (Optional: Biometric confirmation before marking)
-    const compatible = await LocalAuthentication.hasHardwareAsync();
-    if (compatible) {
-      const result = await LocalAuthentication.authenticateAsync({
-        promptMessage: "Confirm Attendance",
-      });
-      if (!result.success) {
-        Alert.alert("Cancelled", "Authentication failed");
-        return;
-      }
-    }
+  const handleOpenScanner = () => {
+    router.push("/(app)/camera");
+  };
 
-    Alert.alert(
-      "Attendance Marked!",
-      `User: ${user?.name}\nLocation: Verified\nQR: Verified`,
+  if (user?.role === 'ADMIN') {
+    return (
+        <View style={styles.loadingContainer}>
+            <Ionicons name="shield-checkmark" size={60} color="#2563eb" style={{ marginBottom: 20 }} />
+            <Text style={styles.userName}>Modo Administrador</Text>
+            <Text style={[styles.userRole, { textAlign: 'center', marginTop: 10, paddingHorizontal: 40 }]}>
+                Has iniciado sesión como Admin. Las funciones de asistencia móvil están reservadas para Estudiantes.
+            </Text>
+            <TouchableOpacity 
+                style={[styles.logoutButton, { marginTop: 40, width: '80%' }]} 
+                onPress={() => signOut()}
+            >
+                <Text style={styles.logoutText}>Cerrar Sesión</Text>
+            </TouchableOpacity>
+        </View>
     );
-    // Here you would call your API to save the attendance record
-  };
+  }
 
-  if (!permission) return <View />;
+  if (isLoading && !isRefreshing) {
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color="#2563eb" />
+      </View>
+    );
+  }
+
+  const currentDate = new Intl.DateTimeFormat('es-ES', { 
+    weekday: 'long', 
+    day: 'numeric', 
+    month: 'long', 
+    year: 'numeric' 
+  }).format(new Date());
 
   return (
-    <ScrollView
-      contentContainerStyle={{
-        flexGrow: 1,
-        padding: 20,
-        backgroundColor: "#f3f4f6",
-      }}
+    <ScrollView 
+        style={styles.container}
+        refreshControl={
+          <RefreshControl refreshing={isRefreshing} onRefresh={onRefresh} />
+        }
     >
-      <View style={{ marginBottom: 30, alignItems: "center" }}>
-        <Image
-          source={require("../../assets/images/favicon.png")}
-          style={{ width: 50, height: 50, marginBottom: 10 }}
-        />
-        <Text style={{ fontSize: 24, fontWeight: "bold", color: "#1f2937" }}>
-          Dashboard
-        </Text>
-        <Text style={{ marginTop: 8, fontSize: 16, color: "#4b5563" }}>
-          Welcome, {user?.name || "User"}!
-        </Text>
-      </View>
-
-      <View style={{ gap: 16 }}>
-        {/* Step 1: Scan QR */}
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Step 1: Scan QR Code</Text>
-          <TouchableOpacity
-            style={[
-              styles.button,
-              isQrScanned ? styles.buttonSuccess : styles.buttonPrimary,
-            ]}
-            onPress={() => {
-              if (!permission.granted) requestPermission();
-              setIsScannerOpen(true);
-            }}
-          >
-            <Text style={styles.buttonText}>
-              {isQrScanned ? "✅ QR Scanned" : "📸 Scan QR"}
-            </Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* Step 2: Verify Location */}
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Step 2: Verify Location</Text>
-          <TouchableOpacity
-            style={[
-              styles.button,
-              isValidLocation ? styles.buttonSuccess : styles.buttonPrimary,
-            ]}
-            onPress={handleCheckLocation}
-          >
-            <Text style={styles.buttonText}>
-              {isValidLocation ? "✅ Location Verified" : "📍 Check Location"}
-            </Text>
-          </TouchableOpacity>
-          {currentDistance !== null && (
-            <Text
-              style={{ textAlign: "center", marginTop: 8, color: "#6b7280" }}
-            >
-              Distance: {currentDistance}m (Max: {TARGET_LOCATION.radiusMeters}
-              m)
-            </Text>
-          )}
-        </View>
-
-        {/* Step 3: Mark Attendance */}
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Step 3: Mark Attendance</Text>
-          <TouchableOpacity
-            disabled={!isQrScanned || !isValidLocation}
-            style={[
-              styles.button,
-              isQrScanned && isValidLocation
-                ? styles.buttonAction
-                : styles.buttonDisabled,
-            ]}
-            onPress={handleMarkAttendance}
-          >
-            <Text style={styles.buttonText}>📝 Mark Attendance</Text>
-          </TouchableOpacity>
-          {(!isQrScanned || !isValidLocation) && (
-            <Text
-              style={{
-                textAlign: "center",
-                marginTop: 8,
-                color: "#ef4444",
-                fontSize: 12,
-              }}
-            >
-              Complete Step 1 & 2 first
-            </Text>
-          )}
-        </View>
-
-        <TouchableOpacity
-          onPress={handleLogout}
-          style={[styles.button, { backgroundColor: "#ef4444", marginTop: 20 }]}
-        >
-          <Text style={styles.buttonText}>Sign Out</Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* QR Scanner Modal */}
-      <Modal visible={isScannerOpen} animationType="slide">
-        <View style={{ flex: 1 }}>
-          <CameraView
-            style={{ flex: 1 }}
-            facing="back"
-            onBarcodeScanned={handleBarCodeScanned}
-          >
-            <View style={{ flex: 1, justifyContent: "flex-end", padding: 50 }}>
-              <Button
-                title="Close Scanner"
-                onPress={() => setIsScannerOpen(false)}
-                color="red"
-              />
+      {/* Header Profile Section */}
+      <View style={styles.header}>
+        <View style={styles.profileRow}>
+          <View style={styles.avatarContainer}>
+            <View style={styles.avatarPlaceholder}>
+                <Text style={styles.avatarText}>{user?.name?.charAt(0) || 'U'}</Text>
             </View>
-          </CameraView>
+          </View>
+          <View style={styles.profileInfo}>
+            <Text style={styles.userName}>{user?.name || "Usuario"}</Text>
+            <Text style={styles.userRole}>
+                {user?.program || "Estudiante"} {user?.group ? `• ${user?.group}` : ''}
+            </Text>
+          </View>
+          <TouchableOpacity 
+            style={styles.notificationButton}
+            onPress={() => router.push("/(app)/notificaciones")}
+          >
+            <View style={styles.bellIcon}>
+                <Ionicons name="notifications" size={24} color="#64748b" />
+                {unreadCount > 0 && <View style={styles.notificationBadge} />}
+            </View>
+          </TouchableOpacity>
         </View>
-      </Modal>
+        <Text style={styles.dateLabel}>{currentDate}</Text>
+      </View>
+
+      {/* Attendance Status Card */}
+      <View style={[styles.statusCard, { backgroundColor: hasMarkedToday ? '#e8f5e9' : '#fff9f0' }]}>
+        <View style={[styles.statusIconContainer, { backgroundColor: hasMarkedToday ? '#10b98120' : '#f59e0b20' }]}>
+          <Ionicons 
+            name={hasMarkedToday ? 'checkmark-circle' : 'time'} 
+            size={32} 
+            color={hasMarkedToday ? '#10b981' : '#f59e0b'} 
+          />
+        </View>
+        <View style={styles.statusContent}>
+          <Text style={styles.statusTitle}>{hasMarkedToday ? 'Asistencia Marcada' : 'Pendiente'}</Text>
+          <Text style={styles.statusSubtitle}>
+            {hasMarkedToday 
+              ? 'Has registrado tu asistencia correctamente' 
+              : 'Aún no has marcado asistencia'}
+          </Text>
+        </View>
+      </View>
+
+      {/* Location Card */}
+      <View style={styles.locationCard}>
+        <View style={styles.locationHeader}>
+          <View style={styles.locationIcon}>
+            <Ionicons name="location" size={18} color="#10b981" />
+          </View>
+          <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center' }}>
+            <Text style={styles.locationTitle}>Ubicación</Text>
+            {isLocationVerified && <Text style={styles.verifiedCheck}>✓</Text>}
+          </View>
+        </View>
+        <Text style={styles.locationText}>{locationName}</Text>
+      </View>
+
+      {/* Main Action: QR Button */}
+      {!hasMarkedToday && (
+        <QRButton onPress={handleOpenScanner} />
+      )}
+
+      {/* History Section */}
+      <View style={styles.historyContainer}>
+        <Text style={styles.sectionTitle}>Historial reciente</Text>
+        {errorMsg ? (
+          <View style={styles.emptyHistory}>
+            <Text style={{ ...styles.emptyHistoryText, color: '#ef4444' }}>{errorMsg}</Text>
+          </View>
+        ) : history.length > 0 ? (
+          history.slice(0, 5).map((item) => (
+            <AttendanceHistoryItem
+              key={item._id}
+              date={formatAttendanceDate(item.markedAt)}
+              time={formatAttendanceTime(item.markedAt)}
+              result={item.result}
+              status={item.status}
+            />
+          ))
+        ) : (
+          <View style={styles.emptyHistory}>
+            <Text style={styles.emptyHistoryText}>No hay registros recientes</Text>
+          </View>
+        )}
+      </View>
+      
+      {/* Space at bottom for tab bar padding */}
+      <View style={{ height: 40 }} />
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  card: {
-    backgroundColor: "white",
-    padding: 20,
+  container: {
+    flex: 1,
+    backgroundColor: "#f8fafc",
+    paddingHorizontal: 20,
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  header: {
+    marginTop: 60,
+    marginBottom: 24,
+  },
+  profileRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  avatarContainer: {
+    marginRight: 12,
+  },
+  avatarPlaceholder: {
+    width: 50,
+    height: 50,
+    borderRadius: 25,
+    backgroundColor: '#2563eb',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarText: {
+    color: 'white',
+    fontSize: 20,
+    fontWeight: 'bold',
+  },
+  profileInfo: {
+    flex: 1,
+  },
+  userName: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#1e293b',
+  },
+  userRole: {
+    fontSize: 14,
+    color: '#64748b',
+  },
+  notificationButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'white',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#f1f5f9',
+  },
+  bellIcon: {
+    position: 'relative',
+  },
+  notificationBadge: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#ef4444',
+    borderWidth: 1,
+    borderColor: 'white',
+  },
+  dateLabel: {
+    fontSize: 14,
+    color: '#94a3b8',
+    textTransform: 'capitalize',
+    textAlign: 'center',
+  },
+  statusCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 16,
     borderRadius: 16,
-    shadowColor: "#000",
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#fef3c7',
+  },
+  statusIconContainer: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
+  statusContent: {
+    flex: 1,
+  },
+  statusTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#92400e',
+  },
+  statusSubtitle: {
+    fontSize: 13,
+    color: '#b45309',
+  },
+  locationCard: {
+    backgroundColor: 'white',
+    padding: 16,
+    borderRadius: 16,
+    marginBottom: 16,
+    shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.05,
     shadowRadius: 4,
     elevation: 2,
   },
-  cardTitle: {
+  locationHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  locationIcon: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#10b98110',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 8,
+  },
+  locationTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#64748b',
+    marginRight: 4,
+  },
+  verifiedCheck: {
+    color: '#10b981',
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  locationText: {
+    marginLeft: 36,
+    fontSize: 14,
+    color: '#1e293b',
+    fontWeight: '500',
+  },
+  historyContainer: {
+    marginTop: 8,
+  },
+  sectionTitle: {
     fontSize: 18,
-    fontWeight: "600",
-    color: "#1f2937",
-    marginBottom: 12,
-    textAlign: "center",
+    fontWeight: '700',
+    color: '#1e293b',
+    marginBottom: 16,
   },
-  button: {
+  emptyHistory: {
+    alignItems: 'center',
+    paddingVertical: 20,
+  },
+  emptyHistoryText: {
+    color: '#94a3b8',
+    fontSize: 14,
+  },
+  logoutButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#fff5f5',
     padding: 16,
-    borderRadius: 12,
-    alignItems: "center",
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#fee2e2',
   },
-  buttonPrimary: { backgroundColor: "#4f46e5" },
-  buttonSuccess: { backgroundColor: "#10b981" }, // Green
-  buttonAction: { backgroundColor: "#2563eb" }, // Blue
-  buttonDisabled: { backgroundColor: "#9ca3af" }, // Gray
-  buttonText: { color: "white", fontWeight: "bold", fontSize: 16 },
+  logoutText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#ef4444',
+  },
 });
